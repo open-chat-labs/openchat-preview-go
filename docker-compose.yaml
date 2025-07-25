@@ -1,0 +1,10 @@
+services:
+  preview:
+    build:
+      context: ./
+      dockerfile: Dockerfile
+    container_name: openchat-preview-go
+    environment:
+      - PORT=5070
+    ports:
+      - 5070:5070
