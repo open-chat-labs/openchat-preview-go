@@ -29,6 +29,7 @@ type OGData struct {
 	Image       string `json:"image,omitempty"`
 	ImageAlt    string `json:"imageAlt,omitempty"`
 	BadResponse bool   `json:"badResponse,omitempty"`
+	Error       string `json:"error,omitempty"`
 }
 
 var cache *lru.LRU[string, OGData]
@@ -93,32 +94,44 @@ func handlePreview(w http.ResponseWriter, r *http.Request) {
 		if callerURL.Scheme == targetURL.Scheme && callerURL.Host == targetURL.Host {
 			msg := fmt.Sprintf("We cannot return meaningful metadata for internal links (yet): %s", rawURL)
 			log.Println(msg)
-			http.Error(w, fmt.Sprintf(`{"error": "%s"}`, msg), http.StatusNotFound)
+			// Internal links are a permanent failure - don't cache since we check before cache lookup
+			data := OGData{
+				BadResponse: true,
+				Error:       "Cannot return meaningful metadata for internal links",
+			}
+			w.Header().Set("Cache-Control", "public, max-age=86400") // 24 hours for client
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(data)
 			return
 		}
 	}
 
+	// Check cache first
 	if data, ok := cache.Get(rawURL); ok {
-		if data.BadResponse {
-			http.Error(w, fmt.Sprintf(`{"error": "OpenGraph metadata not available for %s"}`, rawURL), http.StatusNotFound)
-			return
-		}
 		log.Println("Returning OpenGraph metadata from cache for", rawURL)
 		w.Header().Set("Cache-Control", "public, max-age=3600")
+		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(data)
 		return
 	}
 
+	// Fetch new data
 	data, err := fetchOGData(rawURL)
 	if err != nil {
 		log.Println("Error getting OpenGraph metadata", rawURL, err)
-		cache.Add(rawURL, OGData{BadResponse: true})
-		http.Error(w, fmt.Sprintf(`{"error": "OpenGraph metadata not available for %s"}`, rawURL), http.StatusNotFound)
-		return
+		// Create error response but still return 200
+		data = OGData{
+			BadResponse: true,
+			Error:       fmt.Sprintf("OpenGraph metadata not available for %s", rawURL),
+		}
 	}
 
+	// Cache the result
 	cache.Add(rawURL, data)
+	
+	// Always return 200 with consistent caching headers (1 hour for client)
 	w.Header().Set("Cache-Control", "public, max-age=3600")
+	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(data)
 }
 
@@ -157,6 +170,7 @@ func fetchOGData(rawURL string) (OGData, error) {
 		Description: og.Description,
 		Image:       imageUrl,
 		ImageAlt:    altText,
+		BadResponse: false, // Explicitly set to false for successful responses
 	}, nil
 }
 
