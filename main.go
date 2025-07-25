@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -101,7 +100,7 @@ func handlePreview(w http.ResponseWriter, r *http.Request) {
 
 	if data, ok := cache.Get(rawURL); ok {
 		if data.BadResponse {
-			http.Error(w, `{"error": "OpenGraph metadata not found"}`, http.StatusNotFound)
+			http.Error(w, fmt.Sprintf(`{"error": "OpenGraph metadata not available for %s"}`, rawURL), http.StatusNotFound)
 			return
 		}
 		log.Println("Returning OpenGraph metadata from cache for", rawURL)
@@ -114,7 +113,7 @@ func handlePreview(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Println("Error getting OpenGraph metadata", rawURL, err)
 		cache.Add(rawURL, OGData{BadResponse: true})
-		http.Error(w, fmt.Sprintf(`{"error": "Error getting OpenGraph metadata for %s"}`, rawURL), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf(`{"error": "OpenGraph metadata not available for %s"}`, rawURL), http.StatusNotFound)
 		return
 	}
 
@@ -132,7 +131,7 @@ func fetchOGData(rawURL string) (OGData, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return OGData{}, errors.New("bad status code")
+		return OGData{}, fmt.Errorf("bad status code: %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(resp.Body)
