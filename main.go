@@ -17,10 +17,12 @@ import (
 )
 
 var whitelist = map[string]bool{
-	"http://localhost:5001": true,
-	"https://oc.app":        true,
-	"https://test.oc.app":   true,
+	"http://localhost:5001":  true,
+	"https://oc.app":         true,
+	"https://test.oc.app":    true,
 	"https://webtest.oc.app": true,
+	"http://tauri.localhost": true,
+	"tauri://localhost":	  true,
 }
 
 type OGData struct {
