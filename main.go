@@ -30,6 +30,8 @@ type OGData struct {
 	Description string `json:"description,omitempty"`
 	Image       string `json:"image,omitempty"`
 	ImageAlt    string `json:"imageAlt,omitempty"`
+	ImageWidth  uint64 `json:"imageWidth,omitempty"`
+	ImageHeight uint64 `json:"imageHeight,omitempty"`
 	BadResponse bool   `json:"badResponse,omitempty"`
 	Error       string `json:"error,omitempty"`
 }
@@ -163,8 +165,11 @@ func fetchOGData(rawURL string) (OGData, error) {
 	altText := parseOGAltTag(body)
 
 	var imageUrl string
+	var imageWidth, imageHeight uint64
 	if len(og.Images) > 0 {
 		imageUrl = og.Images[0].URL
+		imageWidth = og.Images[0].Width
+		imageHeight = og.Images[0].Height
 	}
 
 	return OGData{
@@ -172,7 +177,9 @@ func fetchOGData(rawURL string) (OGData, error) {
 		Description: og.Description,
 		Image:       imageUrl,
 		ImageAlt:    altText,
-		BadResponse: false, // Explicitly set to false for successful responses
+		ImageWidth:  imageWidth,
+		ImageHeight: imageHeight,
+		BadResponse: false,
 	}, nil
 }
 
