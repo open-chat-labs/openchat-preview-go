@@ -139,7 +139,31 @@ func handlePreview(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(data)
 }
 
+func isTwitterURL(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Host)
+	return host == "twitter.com" || host == "www.twitter.com" ||
+		host == "x.com" || host == "www.x.com"
+}
+
+func toFxTwitterURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	u.Host = "fxtwitter.com"
+	return u.String()
+}
+
 func fetchOGData(rawURL string) (OGData, error) {
+	if isTwitterURL(rawURL) {
+		rawURL = toFxTwitterURL(rawURL)
+		log.Println("Rewriting Twitter/X URL to fxtwitter:", rawURL)
+	}
+
 	client := http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Get(rawURL)
 	if err != nil {
