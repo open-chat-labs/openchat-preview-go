@@ -139,6 +139,100 @@ func handlePreview(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(data)
 }
 
+// A realistic browser User-Agent plus Google's SOCS consent cookie. Together
+// these get past YouTube's consent interstitial, though not necessarily its
+// datacenter-IP bot check - hence the oEmbed fallback below.
+const browserUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
+func isYouTubeURL(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Host)
+	return host == "youtube.com" || host == "www.youtube.com" ||
+		host == "m.youtube.com" || host == "music.youtube.com" ||
+		host == "youtu.be"
+}
+
+// extractYouTubeVideoID returns the video id from the various YouTube URL
+// shapes (watch, youtu.be, shorts, live, embed), or "" if there isn't one.
+func extractYouTubeVideoID(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	host := strings.ToLower(u.Host)
+	if host == "youtu.be" {
+		return strings.Trim(u.Path, "/")
+	}
+	if id := u.Query().Get("v"); id != "" {
+		return id
+	}
+	for _, prefix := range []string{"/shorts/", "/live/", "/embed/"} {
+		if rest, ok := strings.CutPrefix(u.Path, prefix); ok {
+			return strings.Trim(rest, "/")
+		}
+	}
+	return ""
+}
+
+type oEmbedResponse struct {
+	Title           string `json:"title"`
+	AuthorName      string `json:"author_name"`
+	ThumbnailURL    string `json:"thumbnail_url"`
+	ThumbnailWidth  uint64 `json:"thumbnail_width"`
+	ThumbnailHeight uint64 `json:"thumbnail_height"`
+}
+
+func fetchYouTubeOEmbed(rawURL string) (OGData, error) {
+	// Normalize to the watch form where possible - oEmbed 404s on some URL
+	// shapes (e.g. shorts) but always accepts watch?v=<id>.
+	if id := extractYouTubeVideoID(rawURL); id != "" {
+		rawURL = "https://www.youtube.com/watch?v=" + id
+	}
+	endpoint := "https://www.youtube.com/oembed?format=json&url=" + url.QueryEscape(rawURL)
+
+	client := http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(endpoint)
+	if err != nil {
+		return OGData{}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return OGData{}, fmt.Errorf("bad oEmbed status code: %d", resp.StatusCode)
+	}
+
+	var oe oEmbedResponse
+	if err := json.NewDecoder(resp.Body).Decode(&oe); err != nil {
+		return OGData{}, err
+	}
+	if oe.Title == "" {
+		return OGData{}, fmt.Errorf("oEmbed response contained no title")
+	}
+
+	return OGData{
+		Title:       oe.Title,
+		Description: oe.AuthorName,
+		Image:       oe.ThumbnailURL,
+		ImageWidth:  oe.ThumbnailWidth,
+		ImageHeight: oe.ThumbnailHeight,
+	}, nil
+}
+
+// fetchYouTubeOGData first tries the page itself (which, when it works, includes
+// the video description), then falls back to the oEmbed API which is not
+// bot-walled but carries no description.
+func fetchYouTubeOGData(rawURL string) (OGData, error) {
+	data, err := fetchPageOGData(rawURL, true)
+	if err == nil && data.Title != "" {
+		return data, nil
+	}
+	log.Println("Direct YouTube fetch returned no OG data, falling back to oEmbed:", rawURL)
+	return fetchYouTubeOEmbed(rawURL)
+}
+
 func isTwitterURL(rawURL string) bool {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -164,8 +258,25 @@ func fetchOGData(rawURL string) (OGData, error) {
 		log.Println("Rewriting Twitter/X URL to fxtwitter:", rawURL)
 	}
 
+	if isYouTubeURL(rawURL) {
+		return fetchYouTubeOGData(rawURL)
+	}
+
+	return fetchPageOGData(rawURL, false)
+}
+
+func fetchPageOGData(rawURL string, browserHeaders bool) (OGData, error) {
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		return OGData{}, err
+	}
+	if browserHeaders {
+		req.Header.Set("User-Agent", browserUserAgent)
+		req.Header.Set("Cookie", "SOCS=CAI")
+	}
+
 	client := http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(rawURL)
+	resp, err := client.Do(req)
 	if err != nil {
 		return OGData{}, err
 	}
