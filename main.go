@@ -186,12 +186,15 @@ type oEmbedResponse struct {
 }
 
 func fetchYouTubeOEmbed(rawURL string) (OGData, error) {
-	// Normalize to the watch form where possible - oEmbed 404s on some URL
-	// shapes (e.g. shorts) but always accepts watch?v=<id>.
-	if id := extractYouTubeVideoID(rawURL); id != "" {
-		rawURL = "https://www.youtube.com/watch?v=" + id
+	// Normalize to the watch form - oEmbed 404s on some URL shapes (e.g.
+	// shorts) but always accepts watch?v=<id>. URLs with no extractable id
+	// (channels, playlists, the oEmbed endpoint itself) have no video to
+	// look up, so don't bother asking.
+	id := extractYouTubeVideoID(rawURL)
+	if id == "" {
+		return OGData{}, fmt.Errorf("no video id in YouTube URL, skipping oEmbed")
 	}
-	endpoint := "https://www.youtube.com/oembed?format=json&url=" + url.QueryEscape(rawURL)
+	endpoint := "https://www.youtube.com/oembed?format=json&url=" + url.QueryEscape("https://www.youtube.com/watch?v="+id)
 
 	client := http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Get(endpoint)
