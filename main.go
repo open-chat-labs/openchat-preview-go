@@ -3,17 +3,27 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"image"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
+
+	// Registered for their DecodeConfig implementations only - we never decode
+	// the pixels, just the dimensions out of the format header.
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/dyatlov/go-opengraph/opengraph"
 	lru "github.com/hashicorp/golang-lru/v2/expirable"
+	_ "golang.org/x/image/webp"
 )
 
 var whitelist = map[string]bool{
@@ -42,8 +52,10 @@ func main() {
 	var err error
 	cache = lru.NewLRU[string, OGData](5000, nil, time.Hour)
 
+	rateLimitBuckets = lru.NewLRU[string, *tokenBucket](maxRateLimitedIPs, nil, rateLimitIdleTTL)
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/preview", handlePreview)
+	mux.Handle("/preview", rateLimitMiddleware(http.HandlerFunc(handlePreview)))
 
 	go logMemoryUsage()
 
@@ -61,6 +73,83 @@ func corsMiddleware(next http.Handler) http.Handler {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 		} else if origin != "" {
 			http.Error(w, fmt.Sprintf("Origin %s is not permitted", origin), http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+const (
+	// Per caller IP: a sustained rate with a burst allowance on top. A browser
+	// opening a chat full of links fires a handful of previews at once, hence
+	// the generous burst - the sustained rate is what stops a scripted caller
+	// hammering us.
+	rateLimitPerSecond = 5
+	rateLimitBurst     = 30
+	// Bound the limiter state: at most this many IPs are tracked and a bucket
+	// idle for longer than the TTL is evicted.
+	maxRateLimitedIPs = 10000
+	rateLimitIdleTTL  = 10 * time.Minute
+)
+
+type tokenBucket struct {
+	tokens float64
+	last   time.Time
+}
+
+var (
+	rateLimitMu      sync.Mutex
+	rateLimitBuckets *lru.LRU[string, *tokenBucket]
+)
+
+// allowRequest refills the caller's bucket for the time elapsed since its last
+// request and takes a token, returning false if there wasn't one to take.
+func allowRequest(ip string) bool {
+	rateLimitMu.Lock()
+	defer rateLimitMu.Unlock()
+
+	now := time.Now()
+	bucket, ok := rateLimitBuckets.Get(ip)
+	if !ok {
+		bucket = &tokenBucket{tokens: rateLimitBurst, last: now}
+		rateLimitBuckets.Add(ip, bucket)
+	}
+
+	bucket.tokens += now.Sub(bucket.last).Seconds() * rateLimitPerSecond
+	if bucket.tokens > rateLimitBurst {
+		bucket.tokens = rateLimitBurst
+	}
+	bucket.last = now
+
+	if bucket.tokens < 1 {
+		return false
+	}
+	bucket.tokens--
+	return true
+}
+
+// clientIP prefers the first X-Forwarded-For entry (we sit behind CloudFront)
+// and falls back to the connecting address.
+func clientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		first, _, _ := strings.Cut(xff, ",")
+		if first = strings.TrimSpace(first); first != "" {
+			return first
+		}
+	}
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	return r.RemoteAddr
+}
+
+func rateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip := clientIP(r)
+		if !allowRequest(ip) {
+			log.Println("Rate limiting", ip)
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, `{"error": "Too many requests"}`, http.StatusTooManyRequests)
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -261,11 +350,78 @@ func fetchOGData(rawURL string) (OGData, error) {
 		log.Println("Rewriting Twitter/X URL to fxtwitter:", rawURL)
 	}
 
+	var data OGData
+	var err error
 	if isYouTubeURL(rawURL) {
-		return fetchYouTubeOGData(rawURL)
+		data, err = fetchYouTubeOGData(rawURL)
+	} else {
+		data, err = fetchPageOGData(rawURL, false)
+	}
+	if err != nil {
+		return data, err
 	}
 
-	return fetchPageOGData(rawURL, false)
+	// Callers drop the image entirely unless both dimensions are known, and
+	// plenty of pages omit og:image:width / og:image:height. Non-browser
+	// callers (the bot SDKs) can't measure the image themselves, so do it here.
+	if data.Image != "" && (data.ImageWidth == 0 || data.ImageHeight == 0) {
+		if w, h := measureImage(data.Image); w > 0 && h > 0 {
+			data.ImageWidth, data.ImageHeight = w, h
+		} else {
+			log.Println("Could not determine image dimensions for", data.Image)
+		}
+	}
+
+	return data, nil
+}
+
+const (
+	imageFetchTimeout = 5 * time.Second
+	// The dimensions live in the first few KB of every format we understand,
+	// but a progressive JPEG can carry a lot of metadata ahead of its frame
+	// header. This is a ceiling, not a target - we stop as soon as the header
+	// decodes.
+	maxImageHeaderBytes = 256 * 1024
+)
+
+// measureImage fetches just enough of the image to read its dimensions out of
+// the format header. Everything about this is best effort: any failure returns
+// 0, 0 and the caller simply leaves the dimensions unset.
+func measureImage(rawURL string) (width uint64, height uint64) {
+	// Decoders are fed truncated, untrusted bytes - don't let a panic in one
+	// take down the request.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Println("Panic decoding image header for", rawURL, r)
+			width, height = 0, 0
+		}
+	}()
+
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		return 0, 0
+	}
+	req.Header.Set("User-Agent", browserUserAgent)
+	// A hint only - servers that ignore it are handled by the LimitReader.
+	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", maxImageHeaderBytes-1))
+
+	client := http.Client{Timeout: imageFetchTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, 0
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return 0, 0
+	}
+
+	cfg, _, err := image.DecodeConfig(io.LimitReader(resp.Body, maxImageHeaderBytes))
+	if err != nil || cfg.Width <= 0 || cfg.Height <= 0 {
+		return 0, 0
+	}
+
+	return uint64(cfg.Width), uint64(cfg.Height)
 }
 
 func fetchPageOGData(rawURL string, browserHeaders bool) (OGData, error) {
