@@ -80,12 +80,17 @@ func corsMiddleware(next http.Handler) http.Handler {
 }
 
 const (
-	// Per caller IP: a sustained rate with a burst allowance on top. A browser
-	// opening a chat full of links fires a handful of previews at once, hence
-	// the generous burst - the sustained rate is what stops a scripted caller
-	// hammering us.
-	rateLimitPerSecond = 5
-	rateLimitBurst     = 30
+	// Per caller IP: a sustained rate with a burst allowance on top. This is an
+	// abuse guard, not a capacity control - it should only ever be reachable by
+	// something scripted and pathological. Deliberately far above what any one
+	// user could generate, because an IP is not a user: corporate NAT, mobile
+	// CGNAT and VPNs share one bucket between many genuine users, a server-side
+	// bot caller fans out to many subscribers from a single IP, and if
+	// X-Forwarded-For is ever lost then every request collapses onto one origin
+	// IP. Tripping this on legitimate traffic looks like "previews are flaky"
+	// and is horrible to diagnose, so err loose.
+	rateLimitPerSecond = 100
+	rateLimitBurst     = 300
 	// Bound the limiter state: at most this many IPs are tracked and a bucket
 	// idle for longer than the TTL is evicted.
 	maxRateLimitedIPs = 10000
